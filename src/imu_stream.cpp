@@ -9,6 +9,7 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <esp_task_wdt.h>
 #include <stdarg.h>
 #include <math.h>
 #if SERVER_USE_HTTPS
@@ -16,10 +17,16 @@
 #endif
 
 #include "ICM_20948.h"
+#include "imu_kalman.h"
 
 namespace ImuStream {
 
   static ICM_20948_I2C imu;
+#if IMU_KALMAN_ENABLE
+  static ImuKalman::AngleFilter kalmanPitch;
+  static ImuKalman::AngleFilter kalmanRoll;
+  static unsigned long lastKalmanMs = 0;
+#endif
   static IPAddress serverIP(0, 0, 0, 0);
   static unsigned long lastSendTime = 0;
   static bool ready = false;
@@ -40,6 +47,9 @@ namespace ImuStream {
     bool has68 = false;
     bool has69 = false;
     for (uint8_t addr = 0x08; addr <= 0x77; addr++) {
+      if ((addr & 0x07) == 0) {
+        esp_task_wdt_reset();
+      }
       Wire.beginTransmission(addr);
       uint8_t err = Wire.endTransmission(); // 0 = ACK
       if (err == 0) {
@@ -120,10 +130,13 @@ namespace ImuStream {
     uint8_t secondAddr = firstAd0 ? 0x68 : 0x69;
 
     uint8_t addrOk = 0;
+    esp_task_wdt_reset();
     if (imu.begin(Wire, firstAd0, ICM_20948_ARD_UNUSED_PIN) == ICM_20948_Stat_Ok) {
       addrOk = firstAddr;
+      esp_task_wdt_reset();
     } else if (imu.begin(Wire, !firstAd0, ICM_20948_ARD_UNUSED_PIN) == ICM_20948_Stat_Ok) {
       addrOk = secondAddr;
+      esp_task_wdt_reset();
     } else {
       if (i2cHadAnyAck) {
         Serial.printf("[IMU][CASE_C] ACK 出現但 Init failed（請檢查焊接/供電/AD0 狀態/上拉品質）(try 0x%02X/0x%02X)\n",
@@ -135,6 +148,14 @@ namespace ImuStream {
     }
 
     ready = true;
+#if IMU_KALMAN_ENABLE
+    kalmanPitch.configure(IMU_KALMAN_Q_ANGLE, IMU_KALMAN_Q_GYRO, IMU_KALMAN_R_ANGLE);
+    kalmanRoll.configure(IMU_KALMAN_Q_ANGLE, IMU_KALMAN_Q_GYRO, IMU_KALMAN_R_ANGLE);
+    kalmanPitch.reset();
+    kalmanRoll.reset();
+    lastKalmanMs = millis();
+    Serial.println("[IMU] Kalman fusion enabled (pitch/roll)");
+#endif
     Serial.printf("[IMU] Ready (ICM-20948) addr=0x%02X\n", addrOk);
   }
 
@@ -192,10 +213,34 @@ namespace ImuStream {
     float gy = imu.gyrY();
     float gz = imu.gyrZ();
 
+    float pitchDeg = 0.0f;
+    float rollDeg = 0.0f;
+    float gxK = gx;
+    float gyK = gy;
+#if IMU_KALMAN_ENABLE
+    float pitchAccel = 0.0f;
+    float rollAccel = 0.0f;
+    ImuKalman::accelToPitchRoll(ax, ay, az, pitchAccel, rollAccel);
+    const unsigned long kalmanNow = millis();
+    float dtSec = (lastKalmanMs > 0) ? (kalmanNow - lastKalmanMs) / 1000.0f : (IMU_SEND_INTERVAL_MS / 1000.0f);
+    lastKalmanMs = kalmanNow;
+    const ImuKalman::Result pitchRes = kalmanPitch.update(pitchAccel, gy, dtSec);
+    const ImuKalman::Result rollRes = kalmanRoll.update(rollAccel, gx, dtSec);
+    pitchDeg = pitchRes.angleDeg;
+    rollDeg = rollRes.angleDeg;
+    gxK = rollRes.gyroCorrectedDps;
+    gyK = pitchRes.gyroCorrectedDps;
+#endif
+
     if (standaloneMode) {
       imuReadOkCount++;
+#if IMU_KALMAN_ENABLE
+      Serial.printf("[IMU-TEST] #%lu ax=%.2fg ay=%.2fg az=%.2fg | gx=%.1f gy=%.1f gz=%.1f | pitch=%.1f roll=%.1f\n",
+                    (unsigned long)imuReadOkCount, ax, ay, az, gxK, gyK, gz, pitchDeg, rollDeg);
+#else
       Serial.printf("[IMU-TEST] #%lu ax=%.2fg ay=%.2fg az=%.2fg | gx=%.2fdps gy=%.2fdps gz=%.2fdps\n",
                     (unsigned long)imuReadOkCount, ax, ay, az, gx, gy, gz);
+#endif
       if (imuReadOkCount % 30 == 0) {
         if (fabsf(gx) < 0.5f && fabsf(gy) < 0.5f && fabsf(gz) < 0.5f) {
           Serial.println("[IMU][CASE_E] 連續讀值近乎不變，請手動轉動模組，若仍無變化可能為感測器或讀值路徑異常");
@@ -215,15 +260,21 @@ namespace ImuStream {
              serverIP[0], serverIP[1], serverIP[2], serverIP[3], SERVER_HTTP_PORT, API_IMU_PATH);
 #endif
 
-    StaticJsonDocument<128> doc;
+    StaticJsonDocument<256> doc;
     doc["ax"] = round(ax * 100) / 100.0f;
     doc["ay"] = round(ay * 100) / 100.0f;
     doc["az"] = round(az * 100) / 100.0f;
     doc["gx"] = round(gx * 100) / 100.0f;
     doc["gy"] = round(gy * 100) / 100.0f;
     doc["gz"] = round(gz * 100) / 100.0f;
+#if IMU_KALMAN_ENABLE
+    doc["pitch"] = round(pitchDeg * 10) / 10.0f;
+    doc["roll"] = round(rollDeg * 10) / 10.0f;
+    doc["gx_k"] = round(gxK * 10) / 10.0f;
+    doc["gy_k"] = round(gyK * 10) / 10.0f;
+#endif
 
-    char body[140];
+    char body[200];
     serializeJson(doc, body);
 
     HTTPClient http;

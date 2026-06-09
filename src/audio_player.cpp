@@ -7,6 +7,7 @@
 
 #if AUDIO_I2S_ENABLE
 #include "Audio.h"
+#include <esp_task_wdt.h>
 #endif
 
 namespace AudioPlayer {
@@ -33,10 +34,17 @@ namespace AudioPlayer {
     Serial.println("[AUDIO] I2S speaker disabled (no amp/speaker)");
 #else
     if (audio) return;
-    // I2S1：PDM 麥克風固定佔用 I2S0（ESP32-S3 硬體限制），見 mic_upload.cpp
+    esp_task_wdt_reset();
     audio = new Audio(false, 3, I2S_NUM_1);
+    esp_task_wdt_reset();
+    if (!audio) {
+      Serial.println("[AUDIO] alloc failed");
+      return;
+    }
     audio->setPinout(I2S_BCLK_PIN, I2S_LRC_PIN, I2S_DOUT_PIN);
+    esp_task_wdt_reset();
     audio->setVolume(21);  // 0-21
+    Serial.println("[AUDIO] Ready");
 #endif
   }
 

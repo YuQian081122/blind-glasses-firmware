@@ -7,6 +7,7 @@
 #include <WiFi.h>
 #include <esp_sleep.h>
 #include <esp_task_wdt.h>
+#include "esp_coexist.h"
 #include "driver/rtc_io.h"
 
 #include "config.h"
@@ -21,12 +22,10 @@
 #include "mic_upload.h"
 #include "gps_stream.h"
 #include "ble_quick_link.h"
-#include <Preferences.h>
 
-// 雲端模式下不需要 UDP 探索，伺服器視為永遠可用
 #if CLOUD_MODE
   static inline bool serverReady() { return WiFi.status() == WL_CONNECTED; }
-  static inline IPAddress serverAddr() { return IPAddress(1, 1, 1, 1); } // 佔位，CLOUD_MODE 實際用 hostname
+  static inline IPAddress serverAddr() { return IPAddress(1, 1, 1, 1); }
 #else
   static inline bool serverReady() { return UdpDiscovery::hasServer(); }
   static inline IPAddress serverAddr() { return UdpDiscovery::getServerIP(); }
@@ -34,7 +33,7 @@
 
 static unsigned long lastAudioTriggerTime = 0;
 static const unsigned long AUDIO_FETCH_DELAY_MS = 500;
-static const unsigned long TTS_GRACE_MS = 300;  // TTS 生成的額外等待
+static const unsigned long TTS_GRACE_MS = 300;
 static unsigned long taskCompletedTime = 0;
 static bool waitingForTaskCompletion = false;
 static unsigned long lastAutoAudioTestTime = 0;
@@ -48,57 +47,74 @@ static bool singleBtnVoiceThenMonitor = false;
 static bool voicePlaybackStarted = false;
 static unsigned long gpio1ToggleMs = 0;
 static bool gpio1LevelHigh = false;
-static Preferences wifiPrefs;
+
+static void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
+  if (event == ARDUINO_EVENT_WIFI_STA_CONNECTED) {
+    Serial.printf("[WiFi] Connected ch=%d\n", info.wifi_sta_connected.channel);
+  } else if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+    Serial.printf("[WiFi] Disconnected reason=%d\n",
+                  info.wifi_sta_disconnected.reason);
+  } else if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
+    Serial.printf("[WiFi] Got IP: %s\n", WiFi.localIP().toString().c_str());
+  }
+}
+
+/** BLE 先啟動時，WiFi.begin 前必須開 modem sleep，否則 IDF 直接 abort */
+static inline void wifiApplyRequiredSleepBeforeBegin() {
+#if BLE_QUICK_LINK_ENABLE
+  WiFi.setSleep(true);
+#else
+  WiFi.setSleep(false);
+#endif
+}
 
 void setupWifi() {
-  String ssid = WIFI_SSID;
-  String pass = WIFI_PASSWORD;
-  wifiPrefs.begin("wifi_cfg", false);
-  ssid = wifiPrefs.getString("ssid", ssid);
-  pass = wifiPrefs.getString("pass", pass);
-  wifiPrefs.end();
-
-  Serial.print("Connecting to WiFi ");
-  Serial.println(ssid);
   WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid.c_str(), pass.c_str());
-
-  int retry = 0;
-  while (WiFi.status() != WL_CONNECTED && retry < WIFI_MAX_RETRY) {
-    delay(500);
-    esp_task_wdt_reset();
-    Serial.print(".");
-    retry++;
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println();
-    Serial.println("WiFi connected");
-    Serial.print("IP address: ");
-    Serial.println(WiFi.localIP());
-    // modem sleep 延後到 setup() 尾端，避免與 UDP/I2S/相機初始化衝突觸發 TWDT
-#if CLOUD_MODE
-    Serial.print("API host: https://");
-    Serial.println(SERVER_HOST);
-    Serial.print("Monitor (browser): https://");
-    Serial.print(SERVER_HOST);
-    Serial.println("/monitor");
-    Serial.print("Local MJPEG (LAN only): http://");
-    Serial.print(WiFi.localIP());
-    Serial.print(":");
-    Serial.print(STREAM_PORT);
-    Serial.println(STREAM_PATH);
-#else
-    Serial.print("Stream URL: http://");
-    Serial.print(WiFi.localIP());
-    Serial.print(":");
-    Serial.print(STREAM_PORT);
-    Serial.println(STREAM_PATH);
+  wifiApplyRequiredSleepBeforeBegin();
+#if BLE_QUICK_LINK_ENABLE
+  esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
 #endif
+  WiFi.setAutoReconnect(true);
+
+  String cfgSsid = String(WIFI_SSID);
+  cfgSsid.trim();
+  if (!cfgSsid.isEmpty()) {
+    Serial.printf("[WiFi] Connecting to %s\n", WIFI_SSID);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+    for (int i = 0; i < 10; i++) {
+      if (WiFi.status() == WL_CONNECTED) break;
+      delay(500);
+      esp_task_wdt_reset();
+      Serial.print(".");
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println();
+      Serial.println("WiFi connected");
+      Serial.print("IP address: ");
+      Serial.println(WiFi.localIP());
+#if CLOUD_MODE
+      Serial.printf("API host: https://%s\n", SERVER_HOST);
+      Serial.printf("Monitor: https://%s/monitor\n", SERVER_HOST);
+      Serial.printf("Local MJPEG: http://%s:%d%s\n",
+                    WiFi.localIP().toString().c_str(), STREAM_PORT, STREAM_PATH);
+#else
+      Serial.printf("Stream URL: http://%s:%d%s\n",
+                    WiFi.localIP().toString().c_str(), STREAM_PORT, STREAM_PATH);
+#endif
+    } else {
+      Serial.println();
+      Serial.println("[WiFi] Not connected yet (autoReconnect enabled)");
+      Serial.println("[WiFi] Use BLE to send new WiFi credentials if needed");
+    }
   } else {
-    Serial.println();
-    Serial.println("WiFi connect failed!");
+    Serial.println("[WiFi] WIFI_SSID is empty, skipping");
   }
+
+#if BLE_QUICK_LINK_ENABLE
+  esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
+#endif
 }
 
 void applyWifiFromBle(const String& ssid, const String& pass) {
@@ -107,9 +123,15 @@ void applyWifiFromBle(const String& ssid, const String& pass) {
     return;
   }
   Serial.printf("[BLE] Applying WiFi SSID=%s\n", ssid.c_str());
-  WiFi.disconnect(true, true);
-  delay(50);
+#if BLE_QUICK_LINK_ENABLE
+  esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
+#endif
+  WiFi.disconnect(true, false);
+  delay(500);
   WiFi.mode(WIFI_STA);
+  wifiApplyRequiredSleepBeforeBegin();
+  WiFi.setAutoReconnect(true);
+  delay(200);
   WiFi.begin(ssid.c_str(), pass.c_str());
 }
 
@@ -125,6 +147,7 @@ void triggerFindAlert(unsigned long durationMs) {
 
 void setup() {
   Serial.begin(115200);
+  disableCore0WDT();
   delay(1000);
   Serial.println("\n=== Smart Blind Glasses ===");
 
@@ -140,31 +163,41 @@ void setup() {
 #if IMU_STANDALONE_TEST
   Serial.println("[IMU-TEST] IMU_STANDALONE_TEST=1, skip WiFi/Camera/GPS/Mic/Audio/UDP");
   ImuStream::beginStandalone();
+  enableCore0WDT();
   return;
 #endif
 
   OpMode::begin();
   Serial.printf("[OP] Mode: %s\n", OpMode::isSingleButton() ? "SINGLE_BTN" : "ALWAYS_ON");
+  WiFi.onEvent(onWiFiEvent);
 
   setupWifi();
-  esp_task_wdt_reset();
-#if !CLOUD_MODE
-  UdpDiscovery::begin();
-  esp_task_wdt_reset();
-#endif
-  ButtonHandler::begin();
-  esp_task_wdt_reset();
-  AudioPlayer::begin();
-  esp_task_wdt_reset();
-  MicUpload::begin();
-  esp_task_wdt_reset();
-  HttpTaskQueue::begin();
-  esp_task_wdt_reset();
 
-  if (WiFi.status() == WL_CONNECTED) {
+#if !CLOUD_MODE
+  Serial.println("[INIT] UdpDiscovery");
+  UdpDiscovery::begin();
+#endif
+
+  Serial.println("[INIT] ButtonHandler");
+  ButtonHandler::begin();
+  delay(100);
+
+  Serial.println("[INIT] AudioPlayer");
+  AudioPlayer::begin();
+  delay(100);
+
+  Serial.println("[INIT] MicUpload");
+  MicUpload::begin();
+  delay(100);
+
+  Serial.println("[INIT] HttpTaskQueue");
+  HttpTaskQueue::begin();
+  delay(100);
+
 #if !CAMERA_ENABLE
-    Serial.println("[CAM] Disabled (CAMERA_ENABLE=0)");
+  Serial.println("[CAM] Disabled (CAMERA_ENABLE=0)");
 #else
+  {
     const bool startCam = OpMode::isAlwaysOn() || (CAMERA_START_ON_BOOT);
     if (!startCam) {
 #if POWER_SAVE_ENABLE
@@ -172,21 +205,34 @@ void setup() {
 #else
       Serial.println("[CAM] Skipped at boot (CAMERA_START_ON_BOOT=0, single-btn)");
 #endif
-    } else if (CameraStream::begin()) {
-      Serial.println("[CAM] Ready");
     } else {
-      Serial.println("[CAM] Init failed");
+      Serial.println("[INIT] CameraStream");
+      if (CameraStream::begin()) {
+        Serial.println("[CAM] Ready");
+      } else {
+        Serial.println("[CAM] Init failed");
+      }
     }
-    esp_task_wdt_reset();
-#endif
   }
-  ImuStream::begin();
-  esp_task_wdt_reset();
-  GpsStream::begin();
-  esp_task_wdt_reset();
+  delay(100);
+#endif
 
+  Serial.println("[INIT] ImuStream");
+  ImuStream::begin();
+  delay(100);
+
+  Serial.println("[INIT] GpsStream");
+  GpsStream::begin();
+  delay(100);
+
+#if BLE_QUICK_LINK_ENABLE
+  delay(200);
+#endif
+  Serial.println("[INIT] BleQuickLink");
   BleQuickLink::begin();
-  esp_task_wdt_reset();
+
+  Serial.println("[INIT] setup complete");
+  enableCore0WDT();
 
 #if AUDIO_AUTO_TEST_ENABLE
   lastAutoAudioTestTime = millis();
@@ -335,14 +381,12 @@ void loop() {
     }
   }
 
-  // 偵測背景 HTTP 任務完成
   if (waitingForTaskCompletion && HttpTaskQueue::hasCompletedSinceEnqueue()) {
     taskCompletedTime = millis();
     waitingForTaskCompletion = false;
     Serial.printf("[LAT] Task completed, wait %dms for TTS\n", (int)TTS_GRACE_MS);
   }
 
-  // 智慧等待：任務完成 + TTS 生成時間後才 fetch
   bool fromButton = false;
   if (lastAudioTriggerTime > 0 && !waitingForTaskCompletion) {
     if (taskCompletedTime > 0) {

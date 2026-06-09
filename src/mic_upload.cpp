@@ -13,6 +13,7 @@
 
 #include <driver/i2s.h>
 #include <esp_heap_caps.h>
+#include <esp_task_wdt.h>
 
 // XIAO Sense PDM: DATA=41, CLK=42
 // ESP32-S3：PDM RX 僅支援 I2S0；喇叭 (ESP32-audioI2S) 須用 I2S1，見 audio_player.cpp
@@ -65,7 +66,6 @@ namespace MicUpload {
   }
 
   void begin() {
-    // PDM 麥克風使用 I2S 的 PDM 模式
     i2s_config_t i2s_config = {};
     i2s_config.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_PDM);
     i2s_config.sample_rate = MIC_SAMPLE_RATE;
@@ -85,16 +85,20 @@ namespace MicUpload {
     pin_config.data_out_num = I2S_PIN_NO_CHANGE;
     pin_config.data_in_num = I2S_MIC_DATA_PIN;
 
+    esp_task_wdt_reset();
     if (i2s_driver_install(I2S_MIC_PORT, &i2s_config, 0, NULL) != ESP_OK) {
       Serial.println("[MIC] I2S install failed");
       return;
     }
+    esp_task_wdt_reset();
     if (i2s_set_pin(I2S_MIC_PORT, &pin_config) != ESP_OK) {
       Serial.println("[MIC] I2S pin failed");
       i2s_driver_uninstall(I2S_MIC_PORT);
       return;
     }
+    esp_task_wdt_reset();
     i2s_zero_dma_buffer(I2S_MIC_PORT);
+    esp_task_wdt_reset();
     micDriverOk = true;
     Serial.println("[MIC] Ready");
   }

@@ -9,9 +9,9 @@
 #include <Arduino.h>
 
 // ============ WiFi ============
-#define WIFI_SSID       "ychn._08"
-#define WIFI_PASSWORD   "0980915SIT"
-#define WIFI_MAX_RETRY  20
+#define WIFI_SSID       "奇異鳥吃飛魚"
+#define WIFI_PASSWORD   "11091122"
+#define WIFI_MAX_RETRY  35   // 每次嘗試約 0.5s；BLE 先開時建議 ≥30
 
 // ============ UDP 探索 ============
 #define UDP_DISCOVERY_PORT     9999
@@ -36,18 +36,18 @@
 // NVS 尚無紀錄時的開機預設（曾用切換鍵切過則以 NVS 為準；若要強制改回持續監測可清除快閃或短按切換鍵切一次）
 #define OP_MODE_DEFAULT     OP_MODE_ALWAYS_ON
 
-// ============ 按鈕 - 電源鍵與切換鍵（D1/D2 改供 I2S 後，按鈕改接 D8/D9）============
-#define BTN_POWER_PIN       7    // 電源鍵 → 板載 D8（GPIO7）
-#define BTN_MODE_PIN        8    // 切換鍵 → 板載 D9（GPIO8）
+// ============ 按鈕（與 Arduino/include/config.h 自訂接線一致；I2S 佔 D0–D2）============
+#define BTN_POWER_PIN       35   // 電源鍵
+#define BTN_MODE_PIN        37   // 切換鍵
 #define BTN_SINGLE_PIN      BTN_POWER_PIN
 #define BTN_DEBOUNCE_MS     50
 #define BTN_POWER_HOLD_MS   5000  // 電源鍵長按 5 秒 = 開/關機；切換鍵長按 5 秒 = 語音助理
 
 // ============ I2S (MAX98357A) ============
-// Pin-B 測試版：先不改實體接線，僅在韌體內交換 BCLK/LRC 做相容性排查
-#define I2S_DOUT_PIN    1    // D0（GPIO1）→ MAX98357A DIN
-#define I2S_BCLK_PIN    3    // D2（GPIO3）→ MAX98357A BCLK (test-B swap)
-#define I2S_LRC_PIN     2    // D1（GPIO2）→ MAX98357A LRC/WS (test-B swap)
+// 以下為目前實體接線；喇叭 I2S1 與板載 PDM 麥克風 I2S0 分開
+#define I2S_DOUT_PIN    1
+#define I2S_BCLK_PIN    3
+#define I2S_LRC_PIN     2
 
 // ============ GPIO LED 測試 ============
 // 1=在 loop 中每 2 秒切換測試腳位高低電位，方便接 LED 觀察輸出
@@ -56,12 +56,19 @@
 #define GPIO1_TOGGLE_INTERVAL_MS      2000
 
 // ============ IMU (ICM-20948) ============
-// 與 Seeed XIAO ESP32-S3 腳位圖一致：D4=SDA→GPIO5、D5=SCL→GPIO6（見 Wiki Getting Started）
-#define IMU_SDA_PIN        5    // I2C SDA（板載 D4）
-#define IMU_SCL_PIN        6    // I2C SCL（板載 D5）
+#define IMU_SDA_PIN        7
+#define IMU_SCL_PIN        8
 #define IMU_I2C_ADDR       0x68 // AD0=LOW；若模組 AD0 接 VCC 則為 0x69，begin 時 ad0val=true
 #define IMU_SEND_INTERVAL_MS    100   // 一般
 #define IMU_SEND_INTERVAL_PS_MS 200   // 省電時拉長（POWER_SAVE_ENABLE）
+
+// ============ IMU 卡爾曼融合（加速度傾角 + 陀螺儀）============
+// 1=啟用；0=僅上傳原始六軸
+#define IMU_KALMAN_ENABLE       1
+// 參數說明見 https://jasonblog.github.io/note/osvr/qia_er_man_lv_bo_pei_he_cheng_shi_jiang_jie.html
+#define IMU_KALMAN_Q_ANGLE      0.01f   // 角度過程噪聲
+#define IMU_KALMAN_Q_GYRO       0.01f   // 陀螺儀零偏過程噪聲
+#define IMU_KALMAN_R_ANGLE      0.003f  // 加速度計傾角量測噪聲（愈大愈不信加速度）
 
 // ============ IMU 單獨測試（診斷用） ============
 // 1=開啟「只測 IMU」模式：不啟用 WiFi/伺服器 API，只做 I2C 掃描與連續 gyro/acc 讀值輸出
@@ -132,16 +139,17 @@
 #define FRAME_PUSH_INTERVAL_MS    150
 // 高解析 JPEG + 雲端 TLS 單次 POST 可能較久，勿與 IMU 等短逾時共用
 #define FRAME_PUSH_HTTP_TIMEOUT_MS  15000
-// 與板載 D6/D7 一致：TX=GPIO43、RX=GPIO44（HardwareSerial: RX, TX 順序見 gps_stream.cpp）
-#define GPS_TX_PIN          43   // D6 → ESP UART TX → GPS RX
-#define GPS_RX_PIN          44   // D7 → ESP UART RX ← GPS TX
+// HardwareSerial.begin(baud, cfg, RX, TX) — 見 gps_stream.cpp
+// D6/D7（Seeed XIAO ESP32-S3）：TX=GPIO43、RX=GPIO44；HardwareSerial.begin(..., RX, TX) 見 gps_stream.cpp
+#define GPS_TX_PIN          43   // D6 → ESP UART TX → 模組 RX
+#define GPS_RX_PIN          44   // D7 → ESP UART RX ← 模組 TX
 #define GPS_BAUD            9600
 #define GPS_SEND_INTERVAL_MS    5000   // 一般 5 秒
 #define GPS_SEND_INTERVAL_PS_MS 15000  // 省電時 15 秒上傳一次
 
 // 僅使用相機+陀螺儀時：可關閉 GPS UART；音訊測試時請開啟 I2S 喇叭
-#define GPS_ENABLE          0   // 1=啟用 NEO-M8N 串流；0=不初始化 GPS UART
-#define AUDIO_I2S_ENABLE    0   // 1=MAX98357A 播放；0=不佔用 I2S1（僅測 WiFi 時建議 0）
+#define GPS_ENABLE          1   // 1=啟用 NEO-M8N 串流；0=不初始化 GPS UART
+#define AUDIO_I2S_ENABLE    1   // 1=MAX98357A 播放；0=不佔用 I2S1（僅測 WiFi 時建議 0）
 
 // ============ 音訊自動測試（不需按鈕） ============
 // 1=每隔固定秒數自動抓一次 /audio/latest 測 MAX98357 播放鏈路

@@ -6,6 +6,8 @@
 
 namespace BleQuickLink {
 
+  /** WiFi 前先 BLEDevice::init；begin() 僅建 GATT */
+  void initStackEarly();
   void begin();
   void tick();
 

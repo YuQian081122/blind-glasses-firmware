@@ -35,6 +35,7 @@ namespace BleQuickLink {
   static bool wifiConnected = false;
   static IPAddress wifiIp(0, 0, 0, 0);
   static unsigned long lastNotifyMs = 0;
+  static bool bleStackInitialized = false;
 
   static bool parseWifiApplyPayload(const String& payload) {
     // 相容兩種格式：
@@ -201,13 +202,47 @@ namespace BleQuickLink {
   }
 #endif
 
+  void initStackEarly() {
+#if BLE_QUICK_LINK_ENABLE
+    {
+      Preferences p;
+      if (p.begin("wifi_cfg", false)) {
+        pendingSsid = p.getString("ssid", WIFI_SSID);
+        pendingPass = p.getString("pass", WIFI_PASSWORD);
+        p.end();
+      } else {
+        pendingSsid = String(WIFI_SSID);
+        pendingPass = String(WIFI_PASSWORD);
+      }
+    }
+    pendingSsid.trim();
+    pendingPass.trim();
+    Serial.println("[BLE] stack (BT controller) ready before WiFi");
+    BLEDevice::init(BLE_DEVICE_NAME);
+    BLEDevice::setMTU(517);
+    bleStackInitialized = true;
+#endif
+  }
+
   void begin() {
 #if BLE_QUICK_LINK_ENABLE
-    prefs.begin("wifi_cfg", false);
-    pendingSsid = prefs.getString("ssid", WIFI_SSID);
-    pendingPass = prefs.getString("pass", WIFI_PASSWORD);
-
-    BLEDevice::init(BLE_DEVICE_NAME);
+    if (!bleStackInitialized) {
+      Preferences p;
+      if (p.begin("wifi_cfg", false)) {
+        pendingSsid = p.getString("ssid", WIFI_SSID);
+        pendingPass = p.getString("pass", WIFI_PASSWORD);
+        p.end();
+      } else {
+        pendingSsid = String(WIFI_SSID);
+        pendingPass = String(WIFI_PASSWORD);
+      }
+      pendingSsid.trim();
+      pendingPass.trim();
+      Serial.println("[BLE] stack init on begin (after WiFi)");
+      BLEDevice::init(BLE_DEVICE_NAME);
+      BLEDevice::setMTU(517);
+      bleStackInitialized = true;
+    }
     server = BLEDevice::createServer();
     BLEService* service = server->createService(BLE_SERVICE_UUID);
 
@@ -265,8 +300,11 @@ namespace BleQuickLink {
     requestWifiApply = false;
     ssid = pendingSsid;
     password = pendingPass;
-    prefs.putString("ssid", ssid);
-    prefs.putString("pass", password);
+    if (prefs.begin("wifi_cfg", false)) {
+      prefs.putString("ssid", ssid);
+      prefs.putString("pass", password);
+      prefs.end();
+    }
     return true;
 #else
     (void)ssid;
