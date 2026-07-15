@@ -44,10 +44,11 @@
 #define BTN_POWER_HOLD_MS   5000  // 電源鍵長按 5 秒 = 開/關機；切換鍵長按 5 秒 = 語音助理
 
 // ============ I2S (MAX98357A) ============
-// 以下為目前實體接線；喇叭 I2S1 與板載 PDM 麥克風 I2S0 分開
-#define I2S_DOUT_PIN    1
-#define I2S_BCLK_PIN    3
-#define I2S_LRC_PIN     2
+// 2026-07-15 依實際接線校正：LRC=GPIO1、BCLK=GPIO2、DIN=GPIO3。
+// 喇叭 I2S1 與板載 PDM 麥克風 I2S0 分開。
+#define I2S_LRC_PIN     1
+#define I2S_BCLK_PIN    2
+#define I2S_DOUT_PIN    3
 
 // ============ GPIO LED 測試 ============
 // 1=在 loop 中每 2 秒切換測試腳位高低電位，方便接 LED 觀察輸出
