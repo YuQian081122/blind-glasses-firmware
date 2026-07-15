@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <ArduinoJson.h>
 #include <HTTPClient.h>
 #include <WiFi.h>
 #include <WiFiClient.h>
@@ -16,15 +17,19 @@ constexpr int kMicBckPin = -1;
 constexpr int kMicWsPin = 42;
 constexpr int kMicDataPin = 41;
 constexpr uint32_t kRecordSec = 3;
-constexpr uint32_t kDefaultIntervalMs = 15000;
+constexpr uint32_t kDefaultIntervalMs = 0;
+constexpr uint32_t kCommandPollIntervalMs = 1000;
 constexpr uint32_t kReplyWaitTimeoutMs = 30000;
 constexpr uint32_t kReplyPollIntervalMs = 1000;
 constexpr const char* kMictestPath = "/api/mictest";
+constexpr const char* kCommandPath = "/api/mictest/command";
 constexpr const char* kReplyPath = "/api/mictest/reply.mp3";
 
 bool micReady = false;
 uint32_t intervalMs = kDefaultIntervalMs;
 uint32_t lastRunMs = 0;
+uint32_t lastCommandPollMs = 0;
+uint32_t lastHandledRecordRequestId = 0;
 String serialLine;
 String lastReplyEtag;
 Audio* audio = nullptr;
@@ -219,6 +224,38 @@ int postMictestWav(const uint8_t* data, size_t len, uint32_t& elapsedMs) {
     return code;
 }
 
+bool fetchRecordCommand(uint32_t& requestId, String& status, int& statusCode) {
+    char url[160];
+    buildUrl(url, sizeof(url), kCommandPath);
+    WiFiClient plainClient;
+    WiFiClientSecure secureClient;
+    HTTPClient http;
+
+    if (!beginHttp(http, plainClient, secureClient, url)) {
+        statusCode = -1000;
+        return false;
+    }
+    addDeviceToken(http);
+    http.setTimeout(5000);
+    statusCode = http.GET();
+    String body = http.getString();
+    http.end();
+
+    if (statusCode != 200) {
+        return false;
+    }
+
+    StaticJsonDocument<160> doc;
+    DeserializationError err = deserializeJson(doc, body);
+    if (err) {
+        Serial.printf("[MICTEST] command json error=%s\n", err.c_str());
+        return false;
+    }
+    requestId = doc["record_request_id"] | 0;
+    status = doc["record_status"] | "";
+    return true;
+}
+
 bool replyReady(String& etag, uint32_t& elapsedMs, int& statusCode) {
     char url[160];
     buildUrl(url, sizeof(url), kReplyPath);
@@ -327,6 +364,28 @@ void runCaptureUpload() {
     }
 }
 
+void pollRecordCommand() {
+    if (intervalMs > 0) return;
+    if (WiFi.status() != WL_CONNECTED || !micReady) return;
+    if (audio && audio->isRunning()) return;
+    if (millis() - lastCommandPollMs < kCommandPollIntervalMs) return;
+    lastCommandPollMs = millis();
+
+    uint32_t requestId = 0;
+    String status;
+    int code = 0;
+    if (!fetchRecordCommand(requestId, status, code)) {
+        Serial.printf("[MICTEST] command poll code=%d\n", code);
+        return;
+    }
+    if (requestId > lastHandledRecordRequestId && status == "queued") {
+        lastHandledRecordRequestId = requestId;
+        Serial.printf("[MICTEST] command trigger id=%u\n", static_cast<unsigned>(requestId));
+        runCaptureUpload();
+        lastRunMs = millis();
+    }
+}
+
 void handleSerialCommand(const String& line) {
     String cmd = line;
     cmd.trim();
@@ -338,11 +397,14 @@ void handleSerialCommand(const String& line) {
     }
     if (cmd.startsWith("i ")) {
         long nextInterval = cmd.substring(2).toInt();
-        if (nextInterval >= 1000) {
+        if (nextInterval == 0) {
+            intervalMs = 0;
+            Serial.println("[MICTEST] interval disabled; waiting for web trigger");
+        } else if (nextInterval >= 1000) {
             intervalMs = static_cast<uint32_t>(nextInterval);
             Serial.printf("[MICTEST] interval_ms=%u\n", static_cast<unsigned>(intervalMs));
         } else {
-            Serial.println("[MICTEST] interval ignored, min=1000");
+            Serial.println("[MICTEST] interval ignored, use 0 or >=1000");
         }
         return;
     }
@@ -373,8 +435,8 @@ void setup() {
     connectWifi();
     micReady = initMic();
     initAudio();
-    lastRunMs = millis() - intervalMs + 3000;
-    Serial.println("[MICTEST] auto interval ready; commands: r | i <ms>");
+    lastRunMs = millis();
+    Serial.println("[MICTEST] web trigger ready; commands: r | i <ms> | i 0");
 }
 
 void loop() {
@@ -382,7 +444,8 @@ void loop() {
     if (audio) {
         audio->loop();
     }
-    if (millis() - lastRunMs >= intervalMs) {
+    pollRecordCommand();
+    if (intervalMs > 0 && millis() - lastRunMs >= intervalMs) {
         lastRunMs = millis();
         runCaptureUpload();
     }
