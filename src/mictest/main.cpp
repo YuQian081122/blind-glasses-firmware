@@ -6,6 +6,7 @@
 #include <driver/i2s.h>
 #include <esp_heap_caps.h>
 
+#include "Audio.h"
 #include "config.h"
 
 namespace {
@@ -16,12 +17,41 @@ constexpr int kMicWsPin = 42;
 constexpr int kMicDataPin = 41;
 constexpr uint32_t kRecordSec = 3;
 constexpr uint32_t kDefaultIntervalMs = 15000;
+constexpr uint32_t kReplyWaitTimeoutMs = 30000;
+constexpr uint32_t kReplyPollIntervalMs = 1000;
 constexpr const char* kMictestPath = "/api/mictest";
+constexpr const char* kReplyPath = "/api/mictest/reply.mp3";
 
 bool micReady = false;
 uint32_t intervalMs = kDefaultIntervalMs;
 uint32_t lastRunMs = 0;
 String serialLine;
+String lastReplyEtag;
+Audio* audio = nullptr;
+
+void buildUrl(char* url, size_t len, const char* path) {
+#if SERVER_USE_HTTPS
+    snprintf(url, len, "https://%s%s", SERVER_HOST, path);
+#else
+    snprintf(url, len, "http://%s:%u%s", SERVER_HOST, SERVER_HTTP_PORT, path);
+#endif
+}
+
+bool beginHttp(HTTPClient& http, WiFiClient& plainClient, WiFiClientSecure& secureClient, const char* url) {
+#if SERVER_USE_HTTPS
+    secureClient.setInsecure();
+    return http.begin(secureClient, url);
+#else
+    (void)secureClient;
+    return http.begin(plainClient, url);
+#endif
+}
+
+void addDeviceToken(HTTPClient& http) {
+    if (DEVICE_API_TOKEN[0]) {
+        http.addHeader("X-Device-Token", DEVICE_API_TOKEN);
+    }
+}
 
 void writeWavHeader(uint8_t* buf, uint32_t sampleRate, uint32_t numSamples) {
     const uint32_t byteRate = sampleRate * 2;
@@ -89,6 +119,22 @@ bool initMic() {
     return true;
 }
 
+bool initAudio() {
+    if (audio) return true;
+    audio = new Audio(false, 3, I2S_NUM_1);
+    if (!audio) {
+        Serial.println("[MICTEST] audio alloc failed");
+        return false;
+    }
+    audio->setPinout(I2S_BCLK_PIN, I2S_LRC_PIN, I2S_DOUT_PIN);
+    audio->setVolume(21);
+    Serial.printf("[MICTEST] audio ready bclk=GPIO%d lrc=GPIO%d dout=GPIO%d\n",
+                  I2S_BCLK_PIN,
+                  I2S_LRC_PIN,
+                  I2S_DOUT_PIN);
+    return true;
+}
+
 void connectWifi() {
     WiFi.mode(WIFI_STA);
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -152,36 +198,94 @@ bool recordWav(uint8_t*& wavBuffer, size_t& wavLen, size_t& pcmBytes) {
 
 int postMictestWav(const uint8_t* data, size_t len, uint32_t& elapsedMs) {
     char url[160];
-#if SERVER_USE_HTTPS
-    snprintf(url, sizeof(url), "https://%s%s", SERVER_HOST, kMictestPath);
-    WiFiClientSecure secureClient;
-    secureClient.setInsecure();
-#else
-    snprintf(url, sizeof(url), "http://%s:%u%s", SERVER_HOST, SERVER_HTTP_PORT, kMictestPath);
+    buildUrl(url, sizeof(url), kMictestPath);
     WiFiClient plainClient;
-#endif
+    WiFiClientSecure secureClient;
 
     HTTPClient http;
     uint32_t startedMs = millis();
-#if SERVER_USE_HTTPS
-    if (!http.begin(secureClient, url)) {
-#else
-    if (!http.begin(plainClient, url)) {
-#endif
+    if (!beginHttp(http, plainClient, secureClient, url)) {
         elapsedMs = millis() - startedMs;
         return -1000;
     }
 
     http.addHeader("Content-Type", "audio/wav");
-    if (DEVICE_API_TOKEN[0]) {
-        http.addHeader("X-Device-Token", DEVICE_API_TOKEN);
-    }
+    addDeviceToken(http);
     http.setTimeout(15000);
     int code = http.POST(const_cast<uint8_t*>(data), len);
     (void)http.getString();
     http.end();
     elapsedMs = millis() - startedMs;
     return code;
+}
+
+bool replyReady(String& etag, uint32_t& elapsedMs, int& statusCode) {
+    char url[160];
+    buildUrl(url, sizeof(url), kReplyPath);
+    const uint32_t startedMs = millis();
+
+    while (millis() - startedMs < kReplyWaitTimeoutMs) {
+        WiFiClient plainClient;
+        WiFiClientSecure secureClient;
+        HTTPClient http;
+        if (!beginHttp(http, plainClient, secureClient, url)) {
+            statusCode = -1000;
+            elapsedMs = millis() - startedMs;
+            return false;
+        }
+        addDeviceToken(http);
+        if (lastReplyEtag.length() > 0) {
+            http.addHeader("If-None-Match", lastReplyEtag);
+        }
+        const char* headerKeys[] = {"ETag"};
+        http.collectHeaders(headerKeys, 1);
+        http.setTimeout(8000);
+        statusCode = http.GET();
+        etag = http.header("ETag");
+        http.end();
+
+        if (statusCode == 200 && etag.length() > 0 && etag != lastReplyEtag) {
+            elapsedMs = millis() - startedMs;
+            return true;
+        }
+        Serial.printf("[MICTEST] reply wait code=%d elapsed_ms=%u\n",
+                      statusCode,
+                      static_cast<unsigned>(millis() - startedMs));
+        delay(kReplyPollIntervalMs);
+    }
+
+    elapsedMs = millis() - startedMs;
+    return false;
+}
+
+void playReply(const String& etag, uint32_t waitMs) {
+    if (!audio) {
+        Serial.println("[MICTEST] playback skipped: audio_not_ready");
+        return;
+    }
+
+    char url[180];
+    buildUrl(url, sizeof(url), kReplyPath);
+    Serial.printf("[MICTEST] playback start wait_ms=%u etag=%s\n",
+                  static_cast<unsigned>(waitMs),
+                  etag.c_str());
+    audio->connecttohost(url);
+
+    const uint32_t startedMs = millis();
+    bool sawRunning = false;
+    while (millis() - startedMs < 20000) {
+        audio->loop();
+        if (audio->isRunning()) {
+            sawRunning = true;
+        } else if (sawRunning) {
+            break;
+        }
+        delay(1);
+    }
+    lastReplyEtag = etag;
+    Serial.printf("[MICTEST] playback done elapsed_ms=%u ran=%s\n",
+                  static_cast<unsigned>(millis() - startedMs),
+                  sawRunning ? "yes" : "no");
 }
 
 void runCaptureUpload() {
@@ -208,6 +312,19 @@ void runCaptureUpload() {
                   static_cast<unsigned>(uploadMs),
                   static_cast<unsigned>(wavLen));
     free(wavBuffer);
+
+    if (code > 0 && code < 400) {
+        String replyEtag;
+        uint32_t replyWaitMs = 0;
+        int replyCode = 0;
+        if (replyReady(replyEtag, replyWaitMs, replyCode)) {
+            playReply(replyEtag, replyWaitMs);
+        } else {
+            Serial.printf("[MICTEST] reply timeout code=%d wait_ms=%u\n",
+                          replyCode,
+                          static_cast<unsigned>(replyWaitMs));
+        }
+    }
 }
 
 void handleSerialCommand(const String& line) {
@@ -255,12 +372,16 @@ void setup() {
     Serial.println("[MICTEST] boot");
     connectWifi();
     micReady = initMic();
+    initAudio();
     lastRunMs = millis() - intervalMs + 3000;
     Serial.println("[MICTEST] auto interval ready; commands: r | i <ms>");
 }
 
 void loop() {
     pollSerial();
+    if (audio) {
+        audio->loop();
+    }
     if (millis() - lastRunMs >= intervalMs) {
         lastRunMs = millis();
         runCaptureUpload();
